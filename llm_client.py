@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from openai import OpenAI
 
 import config
@@ -14,18 +15,25 @@ FREIGHT_FIELDS_SPEC = """Extract these fields (use null if not mentioned):
 - destination_state
 - destination_zip
 - cargo_description
-- weight (in lbs)
+- weight (weight of the FIRST line item only, in lbs — do NOT sum multiple rows)
 - weight_unit (lbs or kg)
-- length (in inches)
-- width (in inches)
-- height (in inches)
+- length (in inches — see dimension rules below)
+- width (in inches — see dimension rules below)
+- height (in inches — see dimension rules below)
 - dimension_unit (inches or cm)
-- num_pieces (number of pieces, pallets, or units)
+- num_pieces (number of pallets/pieces in the FIRST line item only — do NOT sum multiple rows)
 - packaging_type (pallet, crate, box, etc.)
 - freight_class
-- special_requirements (list of strings: e.g. hazmat, liftgate, temperature_controlled, residential_delivery, inside_delivery)
+- special_requirements (list of strings: e.g. hazmat, liftgate, temperature_controlled, residential_delivery, inside_delivery, appointment)
 - pickup_date (YYYY-MM-DD format if mentioned)
 - additional_notes (any other relevant info)
+
+DIMENSION EXTRACTION RULES (critical — read carefully):
+- Dimensions on a BOL are always listed as Length x Width x Height (L x W x H) in that order.
+- Do NOT swap or mix up dimension values between rows.
+- Always use the dimensions of the FIRST line item only.
+  Example: row 1 is 48x41x45 and row 2 is 48x42x54 → use row 1: length=48, width=41, height=45
+- Never mix values from different rows or axes.
 
 Respond ONLY with valid JSON. No markdown, no explanation, just the JSON object."""
 
@@ -74,6 +82,7 @@ class LLMClient:
                 email_body=email_body,
             )
 
+        t0 = time.perf_counter()
         response = self.client.chat.completions.create(
             model=config.GROQ_MODEL,
             messages=[
@@ -82,6 +91,7 @@ class LLMClient:
             ],
             temperature=0.1,
         )
+        llm_elapsed = time.perf_counter() - t0
 
         raw_response = response.choices[0].message.content.strip()
         logger.debug(f"Raw LLM response: {raw_response}")
@@ -95,7 +105,7 @@ class LLMClient:
 
         try:
             parsed = json.loads(raw_response)
-            logger.info("Successfully parsed freight details from LLM response.")
+            logger.info(f"Successfully parsed freight details from LLM response (LLM took {llm_elapsed:.2f}s).")
             return parsed
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse LLM response as JSON: {e}")

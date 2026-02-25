@@ -84,6 +84,80 @@ class FreightRequest:
         return "\n".join(lines)
 
 
+# NMFC density → freight class lookup table (density in lbs per cubic foot)
+_CLASS_TABLE = [
+    (50.0,  "50"),
+    (35.0,  "55"),
+    (30.0,  "60"),
+    (22.5,  "65"),
+    (15.0,  "70"),
+    (13.5,  "77.5"),
+    (12.0,  "85"),
+    (10.5,  "92.5"),
+    (9.0,   "100"),
+    (8.0,   "110"),
+    (7.0,   "125"),
+    (6.0,   "150"),
+    (5.0,   "175"),
+    (4.0,   "200"),
+    (3.0,   "250"),
+    (2.0,   "300"),
+    (1.0,   "400"),
+    (0.0,   "500"),
+]
+
+
+def calculate_freight_class(
+    weight_lbs: float,
+    length_in: float,
+    width_in: float,
+    height_in: float,
+    num_pieces: int = 1,
+) -> tuple[str, float]:
+    """Calculate NMFC freight class from density.
+
+    Density is computed per piece:  (weight_per_piece lbs) / (volume_per_piece cu ft)
+    Dimensions are assumed to be per-piece (per pallet).
+
+    Returns (class_string, density_lbs_per_cuft).
+    """
+    if not all([weight_lbs, length_in, width_in, height_in]):
+        return None, None
+
+    pieces = max(num_pieces or 1, 1)
+    weight_per_piece = weight_lbs / pieces
+    volume_cu_ft = (length_in * width_in * height_in) / 1728.0
+
+    if volume_cu_ft <= 0:
+        return None, None
+
+    density = weight_per_piece / volume_cu_ft
+
+    for threshold, cls in _CLASS_TABLE:
+        if density >= threshold:
+            return cls, round(density, 2)
+
+    return "500", round(density, 2)
+
+
+def compare_freight_class(fr: "FreightRequest") -> str:
+    """Return a one-line class comparison string: BOL stated vs density-calculated."""
+    calc_class, density = calculate_freight_class(
+        fr.weight, fr.length, fr.width, fr.height, fr.num_pieces
+    )
+    bol_class = str(fr.freight_class).strip() if fr.freight_class else "N/A"
+
+    if calc_class is None:
+        return "  Class Check: insufficient data for density calculation."
+
+    match = "MATCH" if calc_class == bol_class else "MISMATCH"
+    return (
+        f"  Class Check: BOL={bol_class}  |  Calculated={calc_class} "
+        f"(density {density} lbs/cu ft, {fr.weight} lbs / {fr.num_pieces or 1} pcs, "
+        f"{fr.length}x{fr.width}x{fr.height} in)  ->  {match}"
+    )
+
+
 BOL_EXTENSIONS = {".pdf", ".PDF"}
 BOL_KEYWORDS = {"bol", "bill of lading", "b/l", "shipping"}
 
@@ -98,7 +172,7 @@ def _is_bol_attachment(filename: str) -> bool:
     return True
 
 
-def _extract_text_from_pdf(file_path: str) -> str:
+def extract_text_from_pdf(file_path: str) -> str:
     """Extract text from a PDF file using pdfplumber."""
     text_parts = []
     try:
@@ -117,7 +191,7 @@ def _extract_text_from_file(file_path: str) -> str | None:
     """Extract text from an attachment file based on its type."""
     _, ext = os.path.splitext(file_path.lower())
     if ext == ".pdf":
-        text = _extract_text_from_pdf(file_path)
+        text = extract_text_from_pdf(file_path)
         if text.strip():
             return text
         logger.warning(f"PDF '{file_path}' has no extractable text (may be a scanned image).")
@@ -136,11 +210,8 @@ def process_email(gmail_client: GmailClient, llm_client: LLMClient, message: dic
     logger.info(f"Processing email: '{subject}' from {sender}")
 
     body = gmail_client.get_email_body(message)
-    if not body.strip():
-        logger.warning(f"Email {message_id} has no text body. Skipping.")
-        return None
 
-    # Check for BOL attachments
+    # Check for BOL attachments first (before checking body — email may have only a BOL)
     bol_content = None
     attachments = gmail_client.get_attachments(message)
     if attachments:
@@ -158,6 +229,10 @@ def process_email(gmail_client: GmailClient, llm_client: LLMClient, message: dic
                     break  # Use the first successfully parsed BOL
     else:
         logger.info("No attachments found in email.")
+
+    if not body.strip() and not bol_content:
+        logger.warning(f"Email {message_id} has no text body and no parseable BOL attachment. Skipping.")
+        return None
 
     parsed = llm_client.parse_freight_details(body, bol_content=bol_content)
 
