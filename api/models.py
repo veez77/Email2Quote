@@ -130,6 +130,19 @@ class BookingRequest(BaseModel):
     delivery_note: Optional[str] = None
 
 
+class InvoiceResponse(BaseModel):
+    """Response from GET /invoice?bol_number=...
+
+    The freight invoice is only available after the shipment has been delivered
+    and Priority1 has processed the freight bill.  Call this endpoint after
+    delivery to retrieve the invoice and attach it to the Odoo order.
+    """
+    status: str                             # "success" | "error" | "not_available"
+    bol_number: str
+    invoices: list[dict] = []               # raw Priority1 customerInvoices array
+    errors: list[str] = []
+
+
 class BookingResponse(BaseModel):
     """Response from POST /book."""
     status: str                             # "booked" | "error"

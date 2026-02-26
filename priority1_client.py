@@ -420,6 +420,75 @@ class Priority1Client:
             loc["contact"]["email"] = contact.email
         return loc
 
+    # ------------------------------------------------------------------
+    # Documents & Invoices
+    # ------------------------------------------------------------------
+
+    def get_shipment_document(self, bol_number: str) -> bytes | None:
+        """Fetch the BOL PDF for a dispatched shipment from Priority1.
+
+        Calls POST /v2/ltl/shipments/images to get the document URL, then
+        downloads the PDF bytes.  Returns None if unavailable.
+        """
+        try:
+            resp = requests.post(
+                f"{self.base_url}/v2/ltl/shipments/images",
+                headers=self.headers,
+                json={"bolNumber": bol_number, "imageFormatTypeId": "PDF"},
+                timeout=30,
+            )
+            if not resp.ok:
+                logger.warning(
+                    f"Priority1 images API returned {resp.status_code} for BOL {bol_number}: {resp.text[:200]}"
+                )
+                return None
+            image_url = resp.json().get("imageUrl")
+            if not image_url:
+                logger.warning(f"No imageUrl in Priority1 images response for BOL {bol_number}")
+                return None
+            # Download the actual PDF bytes (Priority1 pre-signed URL — no auth header needed)
+            pdf_resp = requests.get(image_url, timeout=30)
+            if not pdf_resp.ok:
+                logger.warning(f"Failed to download BOL PDF from {image_url}: {pdf_resp.status_code}")
+                return None
+            logger.info(f"Downloaded BOL PDF for {bol_number}: {len(pdf_resp.content)} bytes")
+            return pdf_resp.content
+        except requests.RequestException as e:
+            logger.error(f"Error fetching shipment document for BOL {bol_number}: {e}")
+            return None
+
+    def get_invoice(self, bol_number: str) -> dict:
+        """Fetch the freight invoice for a completed shipment from Priority1.
+
+        Calls GET /v2/admin/customerinvoices?bolNumber={bol_number}.
+        The invoice is only available after the shipment has been delivered
+        and Priority1 has processed the freight bill.
+
+        Returns a dict with keys: status, invoices (list), errors.
+        """
+        try:
+            resp = requests.get(
+                f"{self.base_url}/v2/admin/customerinvoices",
+                headers=self.headers,
+                params={"bolNumber": bol_number},
+                timeout=30,
+            )
+            if not resp.ok:
+                body = resp.text or "(empty)"
+                logger.error(f"Priority1 invoice API {resp.status_code} for BOL {bol_number}: {body[:300]}")
+                return {
+                    "status": "error",
+                    "invoices": [],
+                    "errors": [f"Priority1 invoice API error {resp.status_code}: {body}"],
+                }
+            data = resp.json()
+            invoices = data.get("customerInvoices", [])
+            logger.info(f"Priority1 returned {len(invoices)} invoice(s) for BOL {bol_number}")
+            return {"status": "success", "invoices": invoices, "errors": []}
+        except requests.RequestException as e:
+            logger.error(f"Error fetching invoice for BOL {bol_number}: {e}")
+            return {"status": "error", "invoices": [], "errors": [str(e)]}
+
     @staticmethod
     def _parse_dispatch_response(data: dict) -> dict:
         """Parse Priority1 DispatchShipmentResponse into our standard format."""

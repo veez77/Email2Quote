@@ -14,7 +14,7 @@ import config
 from gmail_client import GmailClient
 from llm_client import LLMClient
 from priority1_client import Priority1Client
-from api.routes import health, quote, booking
+from api.routes import health, quote, booking, documents
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,10 @@ def create_app() -> FastAPI:
             "from its server-side cache using the `quote_id` and submits the dispatch to "
             "Priority1 with an exact item match. "
             "Returns BOL number, pickup confirmation number, and document URLs.\n\n"
+            "### Step 3 — Retrieve documents\n"
+            "- `GET /document/{bol_number}` — download the BOL PDF immediately after booking.\n"
+            "- `GET /invoice?bol_number={bol_number}` — fetch the freight invoice after delivery "
+            "(available 1–3 business days post-delivery).\n\n"
             "**Authentication:** All endpoints require `X-API-Key` header."
         ),
         version="1.0.0",
@@ -82,6 +86,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(quote.router)
     app.include_router(booking.router)
+    app.include_router(documents.router)
     return app
 
 
