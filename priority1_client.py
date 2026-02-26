@@ -1,10 +1,16 @@
+from __future__ import annotations
+
 import logging
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 import requests
 
 import config
 from freight_parser import FreightRequest
+
+if TYPE_CHECKING:
+    from api.models import BookingRequest, ContactInfo
 
 logger = logging.getLogger(__name__)
 
@@ -47,21 +53,14 @@ class Priority1Client:
     Endpoint: https://dev-api.priority1.com
     """
 
-    # Dev-mode normalization: these values are known to return quotes from the
-    # Priority1 dev environment for most lanes.  They replace the actual shipment
-    # parameters only when hitting the dev endpoint so the rest of the pipeline
-    # (email, LLM, FreightRequest) is completely unaffected.
-    _DEV_WEIGHT_LBS = 500.0
-    _DEV_PIECES     = 1
-    _DEV_LENGTH     = 48.0
-    _DEV_WIDTH      = 40.0
-    _DEV_HEIGHT     = 48.0
+    # Class-level cache: quote_id (str) → line item dict that was sent to Priority1.
+    # Shared across all instances so /quote and /book routes (separate instances) see the same data.
+    _quote_item_cache: dict[str, dict] = {}
 
     def __init__(self):
         if not config.PRIORITY1_API_KEY:
             raise ValueError("PRIORITY1_API_KEY not set. Add it to your .env file.")
         self.base_url = config.PRIORITY1_API_URL.rstrip("/")
-        self.is_dev = "dev-api" in self.base_url
         self.headers = {
             "X-Api-Key": config.PRIORITY1_API_KEY,
             "Content-Type": "application/json",
@@ -80,6 +79,7 @@ class Priority1Client:
             }
 
         payload = self._build_payload(freight_request)
+        quote_item = payload["items"][0]  # exact item sent — cache for dispatch replay
         logger.info(
             f"Requesting Priority1 rates: {freight_request.origin_zip} → "
             f"{freight_request.destination_zip}, "
@@ -95,15 +95,22 @@ class Priority1Client:
             )
             response.raise_for_status()
             data = response.json()
-            return self._parse_response(data)
+            result = self._parse_response(data)
+            # Cache the item for every returned quote_id so dispatch can replay it exactly
+            for q in result.get("quotes", []):
+                if q.get("quote_id"):
+                    Priority1Client._quote_item_cache[q["quote_id"]] = quote_item
+            return result
 
         except requests.HTTPError as e:
-            body = e.response.text if e.response else "no body"
-            logger.error(f"Priority1 API HTTP error {e.response.status_code}: {body}")
+            # NOTE: e.response is falsy for 4xx/5xx — use `is not None` not bool check
+            body = e.response.text if e.response is not None else "no body"
+            status_code = e.response.status_code if e.response is not None else "?"
+            logger.error(f"Priority1 API HTTP error {status_code}: {body}")
             return {
                 "status": "error",
                 "quotes": [],
-                "errors": [f"Priority1 API error {e.response.status_code}: {body}"],
+                "errors": [f"Priority1 API error {status_code}: {body}"],
                 "processing_notes": [],
             }
         except requests.RequestException as e:
@@ -146,21 +153,8 @@ class Priority1Client:
             item["width"] = float(fr.width)
         if fr.height:
             item["height"] = float(fr.height)
-
-        # Dev environment: normalize to parameters that have carrier coverage.
-        # Priority1 dev only has rate tables for small-to-medium LTL shipments.
-        if self.is_dev:
-            logger.warning(
-                "DEV MODE: Overriding shipment parameters for Priority1 dev environment "
-                f"(actual: {item['totalWeight']} lbs / {item['units']} pcs  ->  "
-                f"dev: {self._DEV_WEIGHT_LBS} lbs / {self._DEV_PIECES} pcs)"
-            )
-            item["totalWeight"] = self._DEV_WEIGHT_LBS
-            item["units"]       = self._DEV_PIECES
-            item["pieces"]      = self._DEV_PIECES
-            item["length"]      = self._DEV_LENGTH
-            item["width"]       = self._DEV_WIDTH
-            item["height"]      = self._DEV_HEIGHT
+        # Dimensions are cached with the item and replayed exactly at dispatch time,
+        # so Priority1's "items must match quote" check will pass.
 
         # Build accessorial services list
         accessorials = []
@@ -218,8 +212,27 @@ class Priority1Client:
                 "processing_notes": processing_notes or ["Priority1 returned no available rates for this lane."],
             }
 
+        now = datetime.utcnow()
         quotes = []
         for rq in rate_quotes:
+            # Skip quotes that have already expired — they cannot be booked
+            expiration_raw = rq.get("expirationDate")
+            if expiration_raw:
+                try:
+                    exp_dt = datetime.fromisoformat(expiration_raw.rstrip("Z").split(".")[0])
+                    if exp_dt < now:
+                        carrier = rq.get("carrierName", rq.get("carrierCode", "Unknown"))
+                        logger.warning(
+                            f"Skipping expired quote from {carrier} "
+                            f"(id={rq.get('id')}, expired {expiration_raw})"
+                        )
+                        processing_notes.append(
+                            f"Carrier skipped — {carrier}: quote expired ({expiration_raw[:10]})"
+                        )
+                        continue
+                except (ValueError, TypeError):
+                    pass  # unparseable expiry — include the quote and let Priority1 reject if needed
+
             detail = rq.get("rateQuoteDetail", {})
             quotes.append({
                 "carrier_name": rq.get("carrierName", ""),
@@ -231,16 +244,211 @@ class Priority1Client:
                 "total_charge": detail.get("total"),
                 "currency": "USD",
                 "quote_id": str(rq.get("id", "")),
-                "valid_until": rq.get("expirationDate"),
+                "valid_until": expiration_raw,
                 "carrier_quote_number": rq.get("carrierQuoteNumber"),
                 "charges": detail.get("charges", []),
             })
 
-        logger.info(f"Priority1 returned {len(quotes)} rate quote(s).")
+        logger.info(f"Priority1 returned {len(quotes)} valid (non-expired) rate quote(s).")
         processing_notes.insert(0, f"Received {len(quotes)} rate(s) from Priority1.")
         return {
             "status": "success",
             "quotes": quotes,
             "errors": [],
             "processing_notes": processing_notes,
+        }
+
+    # ------------------------------------------------------------------
+    # Dispatch (booking)
+    # ------------------------------------------------------------------
+
+    def dispatch_shipment(self, req: "BookingRequest") -> dict:
+        """Book a shipment against an existing rate quote on Priority1.
+
+        Returns a dict with keys: status, shipment_id, bol_number,
+        pickup_number, bol_url, pallet_label_url, estimated_delivery, errors.
+        """
+        # Look up the exact line item that was sent when this quote was obtained.
+        # This guarantees Priority1's "items must match quote" validation passes.
+        cached_item = Priority1Client._quote_item_cache.get(str(req.quote_id))
+        if not cached_item:
+            logger.error(
+                f"No cached item for quote_id {req.quote_id}. "
+                "Server may have restarted — please re-request a quote."
+            )
+            return {
+                "status": "error",
+                "errors": [
+                    f"Quote {req.quote_id} not found in server cache. "
+                    "Please re-request a quote and try again."
+                ],
+            }
+
+        payload = self._build_dispatch_payload(req, cached_item)
+        logger.info(
+            f"Dispatching shipment: quoteId={req.quote_id}  "
+            f"{req.shipper.zip} → {req.consignee.zip}  "
+            f"pickup={payload.get('pickupWindow', {}).get('date', 'N/A')}"
+        )
+        import json as _json
+        logger.info(f"Dispatch payload:\n{_json.dumps(payload, indent=2)}")
+        try:
+            response = requests.post(
+                f"{self.base_url}/v2/ltl/shipments/dispatch",
+                headers=self.headers,
+                json=payload,
+                timeout=30,
+            )
+            # Use response.text directly (not bool check — 4xx responses are falsy)
+            if not response.ok:
+                body = response.text or "(empty body)"
+                logger.error(
+                    f"Priority1 dispatch HTTP error {response.status_code}: {body}"
+                )
+                return {
+                    "status": "error",
+                    "errors": [f"Priority1 dispatch error {response.status_code}: {body}"],
+                }
+            return self._parse_dispatch_response(response.json())
+
+        except requests.RequestException as e:
+            logger.error(f"Priority1 dispatch request failed: {e}")
+            return {"status": "error", "errors": [str(e)]}
+
+    def _build_dispatch_payload(self, req: "BookingRequest", cached_item: dict) -> dict:
+        """Build the Priority1 DispatchShipmentRequest payload."""
+        # Pickup date: convert YYYY-MM-DD → MM/DD/YYYY; auto-advance if in the past
+        try:
+            pickup_dt = datetime.strptime(req.pickup_date, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            pickup_dt = datetime.now() + timedelta(days=1)
+        if pickup_dt.date() < datetime.now().date():
+            logger.warning(
+                f"Pickup date {req.pickup_date} is in the past — advancing to tomorrow."
+            )
+            pickup_dt = datetime.now() + timedelta(days=1)
+        pickup_date_str = pickup_dt.strftime("%m/%d/%Y")
+
+        # Delivery date: default to pickup + 7 days (Priority1 needs a window)
+        delivery_dt = pickup_dt + timedelta(days=7)
+        delivery_date_str = delivery_dt.strftime("%m/%d/%Y")
+
+        # Replay the exact item that was sent at quote time (Priority1 validates they match).
+        # Add description — required by dispatch but optional at quote time.
+        item = dict(cached_item)
+        item.pop("isMachinery", None)  # dispatch endpoint doesn't accept this field
+        if not item.get("description"):
+            item["description"] = "General Freight"
+
+        accessorials = item.pop("accessorialServices", [])  # pull out if accidentally stored
+
+        payload: dict = {
+            "quoteId": int(req.quote_id),
+            "originLocation": self._build_location(req.shipper),
+            "destinationLocation": self._build_location(req.consignee),
+            "lineItems": [item],
+            "pickupWindow": {
+                "date": pickup_date_str,
+                "startTime": req.pickup_start_time,
+                "endTime": req.pickup_end_time,
+            },
+            "deliveryWindow": {
+                "date": delivery_date_str,
+                "startTime": req.delivery_start_time,
+                "endTime": req.delivery_end_time,
+            },
+        }
+        if req.pickup_note:
+            payload["pickupNote"] = req.pickup_note
+        if req.delivery_note:
+            payload["deliveryNote"] = req.delivery_note
+        if accessorials:
+            payload["accessorialServices"] = accessorials
+
+        # Add reference number as a shipment identifier
+        identifiers = []
+        if req.reference_number:
+            identifiers.append({
+                "type": "CUSTOMER_REFERENCE",
+                "value": req.reference_number,
+                "primaryForType": True,
+            })
+        if identifiers:
+            payload["shipmentIdentifiers"] = identifiers
+
+        return payload
+
+    @staticmethod
+    def _build_location(contact: "ContactInfo") -> dict:
+        # Priority1 expects exactly 10-digit US NANP phone numbers.
+        # NANP area code rules: first digit 2–9, second digit 0–8.
+        import re as _re
+        phone_digits = _re.sub(r"\D", "", contact.phone or "")
+        if len(phone_digits) == 11 and phone_digits.startswith("1"):
+            phone_digits = phone_digits[1:]  # strip leading country code
+        # Validate: 10 digits AND NANP area code (NXX: N=2-9, X=0-8)
+        nanp_ok = (
+            len(phone_digits) == 10
+            and phone_digits[0] in "23456789"
+            and phone_digits[1] in "012345678"
+        )
+        if not nanp_ok:
+            logger.warning(
+                f"Phone '{contact.phone}' for '{contact.company_name}' is not a valid "
+                f"NANP US number — using placeholder. "
+                f"(Odoo should pass extracted_details.origin_phone / destination_phone from the quote response.)"
+            )
+            phone_digits = "8005551234"  # recognisable placeholder
+        loc: dict = {
+            "address": {
+                "addressLine1": contact.address_line1,
+                "city": contact.city,
+                "state": contact.state,
+                "postalCode": contact.zip,
+                "country": contact.country,
+            },
+            "contact": {
+                "companyName": contact.company_name,
+                "phoneNumber": phone_digits,
+            },
+        }
+        if contact.address_line2:
+            loc["address"]["addressLine2"] = contact.address_line2
+        if contact.contact_name:
+            loc["contact"]["contactName"] = contact.contact_name
+        if contact.email:
+            loc["contact"]["email"] = contact.email
+        return loc
+
+    @staticmethod
+    def _parse_dispatch_response(data: dict) -> dict:
+        """Parse Priority1 DispatchShipmentResponse into our standard format."""
+        shipment_id = str(data.get("id", "")) if data.get("id") else None
+
+        bol_number = None
+        pickup_number = None
+        for ident in data.get("shipmentIdentifiers", []):
+            id_type = ident.get("type", "")
+            if id_type == "BILL_OF_LADING" and ident.get("primaryForType"):
+                bol_number = ident.get("value")
+            elif id_type == "PICKUP" and ident.get("primaryForType"):
+                pickup_number = ident.get("value")
+
+        messages = data.get("infoMessages", [])
+        errors = [m["text"] for m in messages if m.get("severity") == "Error"]
+        notes  = [m["text"] for m in messages if m.get("severity") != "Error"]
+
+        logger.info(
+            f"Shipment dispatched — ID: {shipment_id}  BOL: {bol_number}  Pickup: {pickup_number}"
+        )
+        return {
+            "status": "booked",
+            "shipment_id": shipment_id,
+            "bol_number": bol_number,
+            "pickup_number": pickup_number,
+            "bol_url": data.get("capacityProviderBolUrl"),
+            "pallet_label_url": data.get("capacityProviderPalletLabelUrl"),
+            "estimated_delivery": data.get("estimatedDeliveryDate"),
+            "errors": errors,
+            "processing_notes": notes,
         }

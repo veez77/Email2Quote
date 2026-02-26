@@ -12,12 +12,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class FreightRequest:
+    origin_company: str | None = None
     origin_city: str | None = None
     origin_state: str | None = None
     origin_zip: str | None = None
+    origin_phone: str | None = None
+    destination_company: str | None = None
     destination_city: str | None = None
     destination_state: str | None = None
     destination_zip: str | None = None
+    destination_phone: str | None = None
     cargo_description: str | None = None
     weight: float | None = None
     weight_unit: str = "lbs"
@@ -58,8 +62,16 @@ class FreightRequest:
 
         origin = ", ".join(filter(None, [self.origin_city, self.origin_state, self.origin_zip]))
         dest = ", ".join(filter(None, [self.destination_city, self.destination_state, self.destination_zip]))
+        if self.origin_company:
+            lines.append(f"  Shipper:     {self.origin_company}")
         lines.append(f"  Origin:      {origin or 'N/A'}")
+        if self.origin_phone:
+            lines.append(f"  Shipper Ph:  {self.origin_phone}")
+        if self.destination_company:
+            lines.append(f"  Consignee:   {self.destination_company}")
         lines.append(f"  Destination: {dest or 'N/A'}")
+        if self.destination_phone:
+            lines.append(f"  Consignee Ph:{self.destination_phone}")
         lines.append("")
 
         if self.cargo_description:
@@ -116,8 +128,8 @@ def calculate_freight_class(
 ) -> tuple[str, float]:
     """Calculate NMFC freight class from density.
 
-    Density is computed per piece:  (weight_per_piece lbs) / (volume_per_piece cu ft)
-    Dimensions are assumed to be per-piece (per pallet).
+    density = total_weight / (num_pieces × volume_per_piece)
+    Dimensions are per-piece (per pallet); weight is the total for all pieces.
 
     Returns (class_string, density_lbs_per_cuft).
     """
@@ -125,13 +137,13 @@ def calculate_freight_class(
         return None, None
 
     pieces = max(num_pieces or 1, 1)
-    weight_per_piece = weight_lbs / pieces
-    volume_cu_ft = (length_in * width_in * height_in) / 1728.0
+    volume_per_piece_cu_ft = (length_in * width_in * height_in) / 1728.0
+    total_volume_cu_ft = pieces * volume_per_piece_cu_ft
 
-    if volume_cu_ft <= 0:
+    if total_volume_cu_ft <= 0:
         return None, None
 
-    density = weight_per_piece / volume_cu_ft
+    density = weight_lbs / total_volume_cu_ft
 
     for threshold, cls in _CLASS_TABLE:
         if density >= threshold:

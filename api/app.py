@@ -14,7 +14,7 @@ import config
 from gmail_client import GmailClient
 from llm_client import LLMClient
 from priority1_client import Priority1Client
-from api.routes import health, quote
+from api.routes import health, quote, booking
 
 logger = logging.getLogger(__name__)
 
@@ -61,15 +61,27 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Email2Quote API",
         description=(
-            "Freight quoting API. Submit a BOL PDF or plain text freight description "
-            "to extract shipment details and receive carrier quotes.\n\n"
-            "**Authentication:** All `/quote` endpoints require `X-API-Key` header."
+            "## Two-step freight quoting and booking workflow\n\n"
+            "### Step 1 — Get carrier quotes\n"
+            "Submit a BOL PDF (`POST /quote/bol`) or plain-text description (`POST /quote/text`). "
+            "Email2Quote extracts all freight details (weight, dimensions, class, pieces) via LLM "
+            "and fetches live rates from Priority1. "
+            "Returns `QuoteResponse` with `extracted_details` (parsed BOL fields including "
+            "shipper/consignee phones) and `quotes` (one entry per carrier).\n\n"
+            "### Step 2 — Book the chosen quote\n"
+            "Call `POST /book` with the selected `quote_id`, shipper and consignee addresses, "
+            "and a pickup date. **Do not re-send freight details** — Email2Quote retrieves them "
+            "from its server-side cache using the `quote_id` and submits the dispatch to "
+            "Priority1 with an exact item match. "
+            "Returns BOL number, pickup confirmation number, and document URLs.\n\n"
+            "**Authentication:** All endpoints require `X-API-Key` header."
         ),
         version="1.0.0",
         lifespan=lifespan,
     )
     app.include_router(health.router)
     app.include_router(quote.router)
+    app.include_router(booking.router)
     return app
 
 

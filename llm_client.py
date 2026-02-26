@@ -8,12 +8,16 @@ import config
 logger = logging.getLogger(__name__)
 
 FREIGHT_FIELDS_SPEC = """Extract these fields (use null if not mentioned):
+- origin_company (shipper company name from the "Shipper" or "From" section of the BOL)
 - origin_city
 - origin_state
 - origin_zip
+- origin_phone (shipper phone number — digits only, e.g. "8285550100")
+- destination_company (consignee company name from the "Consignee" or "To" section of the BOL)
 - destination_city
 - destination_state
 - destination_zip
+- destination_phone (consignee phone number — digits only)
 - cargo_description
 - weight (weight of the FIRST line item only, in lbs — do NOT sum multiple rows)
 - weight_unit (lbs or kg)
@@ -21,7 +25,7 @@ FREIGHT_FIELDS_SPEC = """Extract these fields (use null if not mentioned):
 - width (in inches — see dimension rules below)
 - height (in inches — see dimension rules below)
 - dimension_unit (inches or cm)
-- num_pieces (number of pallets/pieces in the FIRST line item only — do NOT sum multiple rows)
+- num_pieces (the QUANTITY column value for the FIRST line item — this is the number of pallets or units in that row, e.g. if row 1 shows "10 PLT" then num_pieces=10. Do NOT default to 1 unless the quantity column clearly shows 1. Do NOT sum across rows.)
 - packaging_type (pallet, crate, box, etc.)
 - freight_class
 - special_requirements (list of strings: e.g. hazmat, liftgate, temperature_controlled, residential_delivery, inside_delivery, appointment)
@@ -34,6 +38,19 @@ DIMENSION EXTRACTION RULES (critical — read carefully):
 - Always use the dimensions of the FIRST line item only.
   Example: row 1 is 48x41x45 and row 2 is 48x42x54 → use row 1: length=48, width=41, height=45
 - Never mix values from different rows or axes.
+- Extract the EXACT numeric values — do not round or estimate.
+
+NUM_PIECES EXTRACTION RULES (critical — read carefully):
+- num_pieces is the QUANTITY of pallets/units shown in the FIRST row of the BOL line items table.
+- Look at the "Pieces", "Qty", "Units", or "No." column of the first row — that number is num_pieces.
+- Example: if the BOL table row 1 shows "10  PLT  Packing Paper  8000 lbs", then num_pieces=10.
+- Do NOT assume 1 unless the quantity column explicitly shows 1.
+- The weight field should be the TOTAL weight for that row (all pieces combined).
+
+PHONE EXTRACTION RULES:
+- Extract phone numbers as digits only, no dashes, spaces, or parentheses (e.g. "8285550100").
+- If a phone number has a country code (+1 or 1-), omit it and return only the 10-digit number.
+- If no phone number is present for a party, return null.
 
 Respond ONLY with valid JSON. No markdown, no explanation, just the JSON object."""
 

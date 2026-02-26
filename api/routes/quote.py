@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import tempfile
+import time
 import uuid
 from dataclasses import asdict
 
@@ -10,7 +11,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, UploadFile, File, s
 import config
 from api.dependencies import verify_api_key
 from api.models import CarrierQuote, FreightDetails, QuoteResponse
-from freight_parser import FreightRequest, extract_text_from_pdf
+from freight_parser import FreightRequest, extract_text_from_pdf, compare_freight_class
 from llm_client import LLMClient
 from priority1_client import Priority1Client
 
@@ -20,6 +21,40 @@ router = APIRouter(prefix="/quote", tags=["Quote"])
 # Shared instances (stateless — safe to share across requests)
 _llm = LLMClient()
 _p1 = Priority1Client()
+
+
+def _log_parsed_freight(request_id: str, freight: FreightRequest) -> None:
+    """Log extracted freight details to the server console."""
+    logger.info(freight.summary())
+    logger.info(compare_freight_class(freight))
+
+
+def _log_quotes(request_id: str, p1_result: dict) -> None:
+    """Log Priority1 carrier quotes to the server console (mirrors main._print_quotes)."""
+    quotes = p1_result.get("quotes", [])
+    errors = p1_result.get("errors", [])
+    notes = p1_result.get("processing_notes", [])
+
+    lines = ["=" * 50, "PRIORITY1 CARRIER QUOTES", "=" * 50]
+    for err in errors:
+        lines.append(f"  ERROR: {err}")
+    for note in notes:
+        lines.append(f"  Note: {note.split(chr(10))[0][:120]}")
+    if not quotes:
+        lines.append(f"  Status: {p1_result.get('status', 'unknown')} — no quotes returned.")
+    else:
+        for i, q in enumerate(quotes, 1):
+            lines.append(f"\n  Quote {i}: {q.get('carrier_name', 'Unknown Carrier')}")
+            lines.append(f"    Service:      {q.get('service_level', '')} {q.get('service_level_description', '')}")
+            lines.append(f"    Transit:      {q.get('transit_days', 'N/A')} day(s)  |  Delivery: {q.get('delivery_date', 'N/A')}")
+            lines.append(f"    Total Charge: ${q.get('total_charge') or 0:,.2f}")
+            for charge in q.get("charges", []):
+                lines.append(
+                    f"      {charge.get('code') or '':<8} {charge.get('description') or '':<35} ${charge.get('amount') or 0:>8,.2f}"
+                )
+            lines.append(f"    Quote ID:     {q.get('quote_id', '')}  |  Valid until: {q.get('valid_until', 'N/A')}")
+    lines.append("=" * 50)
+    logger.info("\n".join(lines))
 
 
 def _build_response(request_id: str, freight: FreightRequest, p1_result: dict) -> QuoteResponse:
@@ -66,7 +101,12 @@ async def quote_from_bol(file: UploadFile = File(..., description="BOL document 
         )
 
     request_id = str(uuid.uuid4())
-    logger.info(f"[{request_id}] Received BOL upload: {file.filename} ({len(contents)} bytes)")
+    logger.info("=" * 60)
+    logger.info(f"[{request_id}] NEW REQUEST FROM ODOO TMS — BOL PDF upload")
+    logger.info(f"[{request_id}] File: {file.filename}  |  Size: {len(contents):,} bytes")
+    logger.info("=" * 60)
+
+    t0 = time.perf_counter()
 
     # Write to a named temp file — pdfplumber requires a file path
     tmp_path = None
@@ -90,8 +130,12 @@ async def quote_from_bol(file: UploadFile = File(..., description="BOL document 
             )
 
         freight = FreightRequest.from_dict(parsed)
+        _log_parsed_freight(request_id, freight)
+
         p1_result = await asyncio.to_thread(_p1.get_quote, freight)
-        logger.info(f"[{request_id}] Quote complete. Status: {p1_result.get('status')}")
+        _log_quotes(request_id, p1_result)
+        elapsed = time.perf_counter() - t0
+        logger.info(f"[{request_id}] BOL request complete — {len(p1_result.get('quotes', []))} quote(s) in {elapsed:.2f}s")
         return _build_response(request_id, freight, p1_result)
 
     finally:
@@ -117,7 +161,12 @@ async def quote_from_text(body: str = Body(..., media_type="text/plain")):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Request body is empty.")
 
     request_id = str(uuid.uuid4())
-    logger.info(f"[{request_id}] Received text quote request ({len(body)} chars)")
+    logger.info("=" * 60)
+    logger.info(f"[{request_id}] NEW REQUEST FROM ODOO TMS — plain text")
+    logger.info(f"[{request_id}] Body ({len(body)} chars): {body[:200]}{'...' if len(body) > 200 else ''}")
+    logger.info("=" * 60)
+
+    t0 = time.perf_counter()
 
     parsed = await asyncio.to_thread(_llm.parse_freight_details, body)
     if "error" in parsed:
@@ -127,6 +176,10 @@ async def quote_from_text(body: str = Body(..., media_type="text/plain")):
         )
 
     freight = FreightRequest.from_dict(parsed)
+    _log_parsed_freight(request_id, freight)
+
     p1_result = await asyncio.to_thread(_p1.get_quote, freight)
-    logger.info(f"[{request_id}] Quote complete. Status: {p1_result.get('status')}")
+    _log_quotes(request_id, p1_result)
+    elapsed = time.perf_counter() - t0
+    logger.info(f"[{request_id}] Text request complete — {len(p1_result.get('quotes', []))} quote(s) in {elapsed:.2f}s")
     return _build_response(request_id, freight, p1_result)
