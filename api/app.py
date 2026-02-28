@@ -63,9 +63,10 @@ def create_app() -> FastAPI:
         description=(
             "## Two-step freight quoting and booking workflow\n\n"
             "### Step 1 — Get carrier quotes\n"
-            "Submit a BOL PDF (`POST /quote/bol`) or plain-text description (`POST /quote/text`). "
-            "Email2Quote extracts all freight details (weight, dimensions, class, pieces) via LLM "
-            "and fetches live rates from Priority1. "
+            "Three options: upload a BOL PDF (`POST /quote/bol`), send plain text (`POST /quote/text`), "
+            "or **submit structured JSON freight details directly from your ERP (`POST /quote/details`) — no LLM step, lowest latency**. "
+            "For BOL/text, Email2Quote extracts freight details via LLM. "
+            "All three options fetch live rates from Priority1. "
             "Returns `QuoteResponse` with `extracted_details` (parsed BOL fields including "
             "shipper/consignee phones) and `quotes` (one entry per carrier).\n\n"
             "### Step 2 — Book the chosen quote\n"

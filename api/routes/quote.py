@@ -78,6 +78,47 @@ def _build_response(request_id: str, freight: FreightRequest, p1_result: dict) -
 
 
 @router.post(
+    "/details",
+    response_model=QuoteResponse,
+    summary="Get freight quote from structured JSON freight details",
+    dependencies=[Depends(verify_api_key)],
+)
+async def quote_from_details(details: FreightDetails):
+    """
+    Submit structured freight details directly as JSON — no BOL PDF upload, no LLM extraction.
+
+    Use this when freight data is already available in your system (e.g., from an Odoo sale order).
+    The JSON body maps directly to the `FreightDetails` schema — all fields are optional except
+    `origin_zip` and `destination_zip` which are required by Priority1.
+
+    Returns the same `QuoteResponse` as the other quote endpoints, including `extracted_details`
+    (echoing back the submitted values) and `quotes` (carrier rates from Priority1).
+
+    **Header required:** `X-API-Key: <your-key>`\n
+    **Content-Type:** `application/json`
+    """
+    request_id = str(uuid.uuid4())
+    logger.info("=" * 60)
+    logger.info(f"[{request_id}] NEW REQUEST FROM ODOO TMS — structured JSON details")
+    logger.info(
+        f"[{request_id}] {details.origin_zip} → {details.destination_zip}  |  "
+        f"{details.weight} {details.weight_unit}  |  class {details.freight_class}"
+    )
+    logger.info("=" * 60)
+
+    t0 = time.perf_counter()
+
+    freight = FreightRequest.from_dict(details.model_dump())
+    _log_parsed_freight(request_id, freight)
+
+    p1_result = await asyncio.to_thread(_p1.get_quote, freight)
+    _log_quotes(request_id, p1_result)
+    elapsed = time.perf_counter() - t0
+    logger.info(f"[{request_id}] Details request complete — {len(p1_result.get('quotes', []))} quote(s) in {elapsed:.2f}s")
+    return _build_response(request_id, freight, p1_result)
+
+
+@router.post(
     "/bol",
     response_model=QuoteResponse,
     summary="Get freight quote from a BOL PDF",
