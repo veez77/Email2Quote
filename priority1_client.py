@@ -25,6 +25,8 @@ ACCESSORIAL_MAP = {
     "inside_pickup":          "IPU",
     "appointment":            "APPT",
     "limited_access":         "LAD",
+    "limited_access_pickup":  "LAD",
+    "limited_access_delivery":"LAD",
     "trade_show":             "TSHOW",
     "notify_before_delivery": "NTFY",
 }
@@ -79,7 +81,13 @@ class Priority1Client:
             }
 
         payload = self._build_payload(freight_request)
-        quote_item = payload["items"][0]  # exact item sent — cache for dispatch replay
+        quote_item = dict(payload["items"][0])  # copy — enriched below for dispatch
+        # Compute accessorials and embed in cached item for dispatch replay.
+        # NOT added to the rate quote payload — some codes cause Priority1 to return 500.
+        for req in (freight_request.special_requirements or []):
+            code = ACCESSORIAL_MAP.get(req.lower())
+            if code:
+                quote_item.setdefault("accessorialServices", []).append({"code": code})
         logger.info(
             f"Requesting Priority1 rates: {freight_request.origin_zip} → "
             f"{freight_request.destination_zip}, "
@@ -156,13 +164,6 @@ class Priority1Client:
         # Dimensions are cached with the item and replayed exactly at dispatch time,
         # so Priority1's "items must match quote" check will pass.
 
-        # Build accessorial services list
-        accessorials = []
-        for req in (fr.special_requirements or []):
-            code = ACCESSORIAL_MAP.get(req.lower())
-            if code:
-                accessorials.append({"code": code})
-
         payload = {
             "originZipCode": fr.origin_zip,
             "destinationZipCode": fr.destination_zip,
@@ -177,8 +178,9 @@ class Priority1Client:
             payload["destinationCity"] = fr.destination_city
         if fr.destination_state:
             payload["destinationStateAbbreviation"] = fr.destination_state
-        if accessorials:
-            payload["accessorialServices"] = accessorials
+        # Accessorials are NOT included in the rate quote — some codes cause Priority1
+        # to return 500 on the rate endpoint. They are computed in get_quote(), stored
+        # in the quote item cache, and applied at dispatch time by _build_dispatch_payload().
 
         return payload
 
